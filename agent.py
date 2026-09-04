@@ -1,71 +1,142 @@
-from crewai import Crew, Task, Agent
-from crewai_tools import SerperDevTool
-from langchain_ibm import WatsonxLLM
+"""
+Genomics Literature Review Agent
+Fork lineage: nicknochnack/WatsonxCrewAI -> L1k1th1508/ai-agent -> this.
+
+Original repo built a keynote-writing crew. This keeps the CrewAI
+orchestration pattern but replaces the task entirely: three agents search,
+analyze, and synthesize PubMed literature into a structured review on a
+topic you provide (gene, variant, disease, pathway, etc).
+"""
+
 import os
 
-os.environ["WATSONX_APIKEY"] = "<YOUR WATSONX API KEY HERE>"
-os.environ["SERPER_API_KEY"] = "<YOUR SERPER API KEY HERE>"
+from crewai import LLM, Agent, Crew, Process, Task
 
-# Parameters
-parameters = {"decoding_method": "greedy", "max_new_tokens": 500}
+from pubmed_tool import pubmed_search
 
-# Create the first LLM
-llm = WatsonxLLM(
-    model_id="meta-llama/llama-3-70b-instruct",
-    url="https://us-south.ml.cloud.ibm.com",
-    params=parameters,
-    project_id="<YOUR WATSONX.AI PROJECT ID HERE>",
+# ---------------------------------------------------------------------------
+# LLM setup — local model via Ollama.
+#
+# Prerequisites:
+#   1. Install Ollama: https://ollama.com/download
+#   2. Pull a model with enough context/reasoning for multi-step synthesis:
+#        ollama pull llama3.1        (8B — fast, weaker synthesis quality)
+#        ollama pull qwen2.5:14b     (better instruction-following, needs ~16GB RAM)
+#      A general-purpose chat model is fine — you don't need anything
+#      "medical" or "bio" specific; the domain knowledge lives in the
+#      PubMed abstracts the tool retrieves, not in the model's training data.
+#   3. Make sure `ollama serve` is running (it usually auto-starts).
+#
+# Set OLLAMA_MODEL to whatever you pulled, or leave the default below.
+# ---------------------------------------------------------------------------
+llm = LLM(
+    model=f"ollama/{os.getenv('OLLAMA_MODEL', 'qwen2.5:14b')}",
+    base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+    temperature=0.2,
 )
 
-# Create the function calling llm
-function_calling_llm = WatsonxLLM(
-    model_id="ibm-mistralai/merlinite-7b",
-    url="https://us-south.ml.cloud.ibm.com",
-    params=parameters,
-    project_id="<YOUR WATSONX.AI PROJECT ID HERE>",
-)
-
-# Tools
-search = SerperDevTool()
-
-# Create the agent
-researcher = Agent(
+# ---------------------------------------------------------------------------
+# Agents
+# ---------------------------------------------------------------------------
+literature_scout = Agent(
+    role="Genomics Literature Scout",
+    goal="Find the most relevant, credible PubMed papers on the given topic",
+    backstory=(
+        "A research librarian specializing in genomics and molecular biology. "
+        "Knows how to construct precise PubMed queries (gene names, variant "
+        "nomenclature, MeSH-adjacent terms) to surface primary research over "
+        "reviews unless reviews are explicitly requested."
+    ),
+    tools=[pubmed_search],
     llm=llm,
-    function_calling_llm=function_calling_llm,
-    role="Senior AI Researcher",
-    goal="Find promising research in the field of quantum computing.",
-    backstory="You are a veteran quantum computing researcher with a background in modern physics.",
-    allow_delegation=False,
-    tools=[search],
-    verbose=1,
+    verbose=True,
 )
 
-# Create a task
-task1 = Task(
-    description="Search the internet and find 5 examples of promising AI research.",
-    expected_output="A detailed bullet point summary on each of the topics. Each bullet point should cover the topic, background and why the innovation is useful.",
-    output_file="task1output.txt",
-    agent=researcher,
-)
-
-# Create the second agent
-writer = Agent(
+findings_analyst = Agent(
+    role="Findings Analyst",
+    goal="Extract the concrete claims, methods, and results from each paper",
+    backstory=(
+        "A genomics postdoc who reads papers for a living. For each paper, "
+        "pulls out: the specific question asked, methodology (cohort size, "
+        "sequencing/assay type, statistical approach), the actual result "
+        "with numbers where available, and stated limitations. Flags when "
+        "a paper's claims are preliminary, underpowered, or contradicted "
+        "elsewhere in the set."
+    ),
     llm=llm,
-    role="Senior Speech Writer",
-    goal="Write engaging and witty keynote speeches from provided research.",
-    backstory="You are a veteran quantum computing writer with a background in modern physics.",
-    allow_delegation=False,
-    verbose=1,
+    verbose=True,
 )
 
-# Create a task
-task2 = Task(
-    description="Write an engaging keynote speech on quantum computing.",
-    expected_output="A detailed keynote speech with an intro, body and conclusion.",
-    output_file="task2output.txt",
-    agent=writer,
+synthesis_writer = Agent(
+    role="Synthesis Writer",
+    goal="Turn the analyzed findings into a structured, citable literature review",
+    backstory=(
+        "A scientific writer who organizes findings by theme rather than "
+        "paper-by-paper, explicitly calls out where the literature agrees, "
+        "where it conflicts, and what's still an open question. Every claim "
+        "is attributed to a PMID. Never states a finding without a citation."
+    ),
+    llm=llm,
+    verbose=True,
 )
 
-# Put all together with the crew
-crew = Crew(agents=[researcher, writer], tasks=[task1, task2], verbose=1)
-print(crew.kickoff())
+# ---------------------------------------------------------------------------
+# Tasks
+# ---------------------------------------------------------------------------
+search_task = Task(
+    description=(
+        "Search PubMed for papers on: {topic}\n"
+        "Retrieve at least 10-15 relevant papers, prioritizing recent "
+        "primary research. If the initial query returns few or irrelevant "
+        "results, refine the query (try synonyms, gene aliases, narrower "
+        "or broader terms) and search again."
+    ),
+    expected_output="A list of papers with PMID, title, authors, year, journal, and abstract.",
+    agent=literature_scout,
+)
+
+analysis_task = Task(
+    description=(
+        "For each paper found, extract: (1) the specific research question, "
+        "(2) methodology and sample/cohort size, (3) key quantitative "
+        "results, (4) stated limitations. Note any papers that contradict "
+        "each other."
+    ),
+    expected_output="A structured breakdown of findings per paper, with PMIDs preserved.",
+    agent=findings_analyst,
+    context=[search_task],
+)
+
+synthesis_task = Task(
+    description=(
+        "Write a literature review on '{topic}' organized by theme (not "
+        "paper-by-paper). Structure it as:\n"
+        "1. Overview (2-3 sentences on the state of the field)\n"
+        "2. Key findings by theme, each claim cited with (PMID: xxxxxxx)\n"
+        "3. Areas of consensus\n"
+        "4. Contradictions or unresolved questions in the literature\n"
+        "5. Gaps / suggested directions for further research\n"
+        "6. Full reference list (PMID + title + year + link)\n"
+        "Do not state any claim without a PMID citation."
+    ),
+    expected_output="A complete markdown literature review document.",
+    agent=synthesis_writer,
+    context=[search_task, analysis_task],
+    output_file=f"outputs/{{topic_slug}}_review.md",
+)
+
+crew = Crew(
+    agents=[literature_scout, findings_analyst, synthesis_writer],
+    tasks=[search_task, analysis_task, synthesis_task],
+    process=Process.sequential,
+    verbose=True,
+)
+
+if __name__ == "__main__":
+    topic = input("Genomics research topic (gene, variant, disease, pathway, etc.): ").strip()
+    topic_slug = "".join(c if c.isalnum() else "_" for c in topic.lower())[:50]
+
+    result = crew.kickoff(inputs={"topic": topic, "topic_slug": topic_slug})
+
+    print(f"\n{'=' * 60}\nReview complete. Saved to outputs/{topic_slug}_review.md\n{'=' * 60}\n")
+    print(result)
